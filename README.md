@@ -21,8 +21,9 @@ The script here is a thin wrapper around it. Full library and docs:
 > stored, never put in an environment variable, never left in your command
 > history, and never printed. Your year-long login token is saved privately and
 > never shown on screen. The script even refuses to run where your password
-> can't be hidden. Read it top to bottom if you want -- it's about 600 lines,
-> comments and all.
+> can't be hidden. Everything Garmin sends back is treated as untrusted and
+> sanitized before it reaches a filename or a note. Read it top to bottom if
+> you want -- it's about 490 lines, comments and all.
 
 ## The easy way: paste this into Claude Code and let it build everything
 
@@ -134,45 +135,58 @@ By default the script writes a clean folder your AI can read:
 
 ```text
 garmin/
-  daily/2026-06-28.md          # one wellness note per day, plain English
-  activities/2026-06-28-...md   # one note per workout
-  data.json                    # the full store, updated each run
+  daily/2026-06-28.md                       # one wellness note per day
+  activities/2026-06-28-running-12345.md    # one note per workout
+  data.json                                 # the full store, updated each run
 ```
 
 A daily note looks like this:
 
 ```text
 # Garmin wellness 2026-06-28
+
 - Resting HR: 48 bpm
-- HRV (overnight): 72 ms
+- HRV (overnight): 72 ms (BALANCED)
 - Sleep: 7.7 h (score 84)
 - Body battery: 28 -> 96
 - Stress (avg): 31
 - Steps: 11240
-- Training readiness: 81
+- Training readiness: 81 (HIGH)
+- Active kcal: 842
 ```
+
+Anything your device didn't record shows as `n/a` rather than vanishing, so you
+can tell "I slept badly" apart from "the watch wasn't on my wrist".
 
 And a workout note:
 
 ```text
-# Morning Run
-- Date: 2026-06-28 06:12
-- Type: running
-- Distance: 10.02 km
-- Duration: 52m 14s
+# Garmin activity 2026-06-28 (running)
+
+- Name: `Morning Run`
+- Start: 2026-06-28 06:12:33
+- Distance: 10.0 mi
+- Duration: 52 min
+- Pace: 5:13 /mi
 - Avg HR: 148 bpm (max 171)
-- Avg pace: 5:13 /km
-- Elevation gain: 84 m
+- Elevation gain: 276 ft
+- Training effect: 3.4
 - Calories: 712
-- Training effect: aerobic 3.4, anaerobic 0.6
 ```
 
+Distances are miles and feet. If you want metric, `render_activity()` is the one
+function to change.
+
 Point your AI coach at the `garmin/` folder and it has your recovery context every
-morning. (Sleep and HRV only fill in on nights you actually wear the watch to bed;
-days you didn't wear it just say so.)
+morning. (Sleep and HRV only fill in on nights you actually wear the watch to bed.)
 
 `data.json` is cumulative -- each run merges into it rather than replacing it, so
-your history builds up even though you only pull the last few days at a time.
+your history builds up even though you only pull the last few days at a time. It
+also keeps the raw Garmin payload for every record, so you can pull out a field
+the notes don't show without re-syncing.
+
+A day with no data at all is skipped rather than written, so a re-sync can never
+blank out a note you already have.
 
 ### Options
 
@@ -183,8 +197,12 @@ your history builds up even though you only pull the last few days at a time.
 | `--dry-run` | print what it would save, save nothing |
 | `--sink files` | write the `garmin/` folder of notes (default) |
 | `--sink supabase` | POST to your own endpoint instead |
-| `--out PATH` | where to write the notes (default `./garmin`) |
+| `--out PATH` | where to write the notes (default: a `garmin/` folder next to the script) |
+| `--tokens PATH` | where the login token lives (default `~/.garminconnect`) |
 | `--export-ci-token` | write the token bundle for a GitHub secret (Path A only) |
+
+`--days` is capped at 90. Pulling more in one go gets you rate-limited by Garmin,
+which costs you the whole run.
 
 Why `--days 3` and not `--days 1`? Garmin backfills sleep and HRV for a night or
 two after the fact. Re-pulling a day just overwrites it, so a small overlap costs
@@ -194,21 +212,26 @@ nothing and catches the late arrivals.
 
 ## Path A: GitHub Actions (cloud, automatic)
 
-1. Put the script in a GitHub repo of your own -- **a private one**. Copy
-   `garmin-sync.yml` into a `.github/workflows/` folder in that repo.
+1. Put the script in a GitHub repo of your own -- **a private one**. The
+   workflow expects `sync_garmin.py` and `requirements.txt` at
+   `scripts/garmin/`; if you put them elsewhere, change the two paths in the
+   workflow and nothing else. Copy `garmin-sync.yml` into `.github/workflows/`
+   in that repo.
 
 2. In the repo: Settings > Secrets and variables > Actions, add:
 
    | Secret | Value |
    |--------|-------|
-   | `GARMIN_TOKEN_B64` | the contents of `garmin-ci-token.txt` from `--export-ci-token` |
+   | `GARMIN_TOKEN_B64` | the contents of `garmin-ci-token.txt` from `--export-ci-token` (a base64 tarball of your token folder, which the workflow unpacks) |
    | `GARMIN_INGEST_URL` | your ingest endpoint, if you use one |
    | `SESSION_LOG_SECRET` | the shared secret your endpoint checks |
 
    If you only want the files mode and no database, change the workflow's last
-   step to `--sink files` and skip the URL and secret. The workflow file has a
-   commented-out step that commits the notes back to the repo, plus the one
-   permission change it needs.
+   step to `--sink files` and skip the URL and secret -- but then the notes only
+   exist inside the CI runner, which is thrown away when the job ends. To keep
+   them you would have to commit them back, which means your sleep, HRV and
+   resting heart rate live in a git repo. Fine in a private repo you own; if
+   that sounds wrong, Path B is the answer.
 
 3. Open the Actions tab and click Run workflow once to confirm a green run. After
    that it runs every morning on its own.
@@ -228,7 +251,7 @@ After Step 1, schedule the script on your own machine.
 ```bash
 crontab -e
 # run every morning at 6am:
-0 6 * * * cd /path/to/garmin-ai && python sync_garmin.py --days 3 --sink files --out ./garmin
+0 6 * * * cd /path/to/garmin-ai && python3 sync_garmin.py --days 3 --sink files --out ./garmin
 ```
 
 **Windows (Task Scheduler):** create a Basic Task that runs daily and calls:
@@ -251,8 +274,10 @@ export GARMIN_INGEST_SECRET="your-shared-secret"
 python sync_garmin.py --days 3 --sink supabase
 ```
 
-It POSTs `{activities, wellness}` with an `Authorization: Bearer` header. The URL
-must be `https://` -- the script refuses to send your health data over plain HTTP.
+It POSTs `{activities, wellness}` with an `Authorization: Bearer` header, and
+sends the raw Garmin payload alongside the tidied fields. `SESSION_LOG_SECRET`
+is accepted as an alias for `GARMIN_INGEST_SECRET`, which is what the GitHub
+Actions path uses.
 
 ---
 
@@ -260,13 +285,18 @@ must be `https://` -- the script refuses to send your health data over plain HTT
 
 | What you see | What to do |
 |--------------|------------|
-| `not logged in yet` | run `python sync_garmin.py --login` |
-| `the saved login token no longer works` | the yearly token expired -- run `--login` again |
-| `GARMIN_TOKEN_B64 was rejected` | re-run `--login`, then `--export-ci-token`, update the secret |
-| `--login needs a real terminal` | you're piping input or in an editor pane; use a real terminal |
-| login suddenly fails for everyone | Garmin changed something: `pip install -U garminconnect`, then re-run `--login` |
-| `(skipped training readiness: ...)` | normal -- your device doesn't report that one; everything else still saves |
-| a day's note says "No data recorded" | you didn't wear the watch that day |
+| `No valid saved token` | run `python3 sync_garmin.py --login` |
+| `Stopping: GarminConnectAuthenticationError` | the yearly token expired -- run `--login` again |
+| `Stopping: GarminConnectTooManyRequestsError` | Garmin is rate-limiting you; wait an hour, and pull fewer days |
+| `Could not reach Garmin ... network problem` | exactly what it says. **Do not re-enter your password** -- nothing is wrong with your login |
+| `Run --login from a real terminal` | you're in an IDE console, Git Bash, or a pipe; use Terminal or PowerShell |
+| `(skipped get_training_readiness: ...)` | normal -- your device doesn't report that one; everything else still saves |
+| `(no data -- skipped, existing note kept)` | you didn't wear the watch that day |
+| login suddenly fails for everyone | Garmin changed something: bump the pinned `garminconnect` version, then re-run `--login` |
+
+That third row is deliberate. A tool that says "login failed, try your password
+again" every time the wifi drops is training you to type your Garmin password
+into whatever asks -- which is the exact habit phishing relies on.
 
 ---
 
@@ -280,6 +310,8 @@ must be `https://` -- the script refuses to send your health data over plain HTT
 - Keep your token private. It is a login credential (about a year of access).
   Never post it, never commit it to git, never paste it into a chat. The included
   `.gitignore` already excludes it, along with the `garmin/` data folder.
+- The dependencies are pinned to exact versions on purpose, so a future
+  compromised release can't slip in during an install. Bump them deliberately.
 - Your notes are plain text files. If this folder lives in Dropbox / OneDrive /
   iCloud, they sync to that cloud. Fine if that's what you want -- just know it.
 

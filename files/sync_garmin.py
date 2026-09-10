@@ -1,593 +1,493 @@
 #!/usr/bin/env python3
-"""Pull your own Garmin data into plain-text notes your AI coach can read.
+"""
+sync_garmin.py -- read-only Garmin Connect -> local files (or your own ingest).
 
-Read-only. This script never writes anything back to your Garmin account.
+Garmin has no official consumer API. This script uses the open-source
+python-garminconnect library (which drives Garmin's mobile login flow) to pull
+activities + daily wellness and send them to one of two sinks:
 
-It is a thin wrapper around the open-source python-garminconnect library by
-cyberjunky (https://github.com/cyberjunky/python-garminconnect).
+  --sink files      write a folder of markdown notes + a data.json  (DEFAULT)
+  --sink supabase   POST to your own ingest endpoint (the GitHub Actions path)
 
-Typical use:
+Security posture (hardened after a community security review -- thanks Patrick):
+  - Password is typed once into a HIDDEN prompt. Never stored, never in env
+    vars, never in shell history, never printed. The script refuses to run in
+    a terminal that can't hide it.
+  - The ~1-year login token is saved to a private dir (~/.garminconnect) with
+    locked-down permissions and is NEVER printed to the screen. The only way to
+    get the token out (for GitHub Actions) is an explicit --export-ci-token,
+    which writes it to a file you delete after pasting it into a CI secret.
+  - Every string Garmin returns is sanitized before it touches a filename or a
+    note (treat the API as untrusted).
+  - A network failure says "network problem, do NOT re-enter your password" so
+    you never get trained into re-typing it -- the habit phishing lives on.
 
-    python sync_garmin.py --login              # once, interactive
-    python sync_garmin.py --days 3 --dry-run   # check it works
-    python sync_garmin.py --days 3             # write ./garmin/
+Usage:
+  python sync_garmin.py --login              one-time interactive login (email/password/2FA)
+  python sync_garmin.py --days 3 --dry-run   print what would be written
+  python sync_garmin.py --days 3             write markdown notes + data.json
+  python sync_garmin.py --export-ci-token    write the CI token bundle to a file (Path A only)
 
-About your credentials:
-
-  * Your password is typed once, into a hidden prompt. It is never stored,
-    never read from an environment variable or a command-line flag, never
-    written to disk, and never printed.
-  * The login token Garmin hands back (good for about a year) is saved to a
-    private directory with owner-only permissions, and is never printed.
-  * --login refuses to run anywhere the password prompt cannot be hidden.
+(Windows: use "py". macOS/Linux: "python3".)
 """
 
-from __future__ import annotations
-
 import argparse
+import base64
 import getpass
+import hashlib
 import json
 import os
 import re
-import stat
 import sys
 import warnings
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-# Where the yearly login token lives. Override with GARMINTOKENS if you like.
-TOKEN_DIR = Path(os.environ.get("GARMINTOKENS", Path.home() / ".garminconnect"))
+try:
+    from garminconnect import (
+        Garmin,
+        GarminConnectAuthenticationError,
+        GarminConnectConnectionError,
+        GarminConnectTooManyRequestsError,
+    )
+except ImportError:
+    sys.exit("garminconnect not installed. Run: pip install -r requirements.txt")
 
-# Written by --export-ci-token, read by nobody. You paste it into a GitHub
-# secret and then delete it.
-CI_TOKEN_FILE = Path("garmin-ci-token.txt")
+DEFAULT_TOKEN_DIR = Path(os.environ.get("GARMINTOKENS", "") or (Path.home() / ".garminconnect"))
+DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "garmin"
+MAX_DAYS = 90
+CMD = "py sync_garmin.py" if os.name == "nt" else "python3 sync_garmin.py"
 
-# If someone tries to hand us a password the unsafe way, we say so and ignore it.
-FORBIDDEN_PASSWORD_ENV = ("GARMIN_PASSWORD", "GARMIN_PASSWD", "GARMINCONNECT_PASSWORD")
-
-
-# --------------------------------------------------------------------------
-# small helpers
-# --------------------------------------------------------------------------
-
-def die(msg: str, code: int = 1):
-    print(f"\nError: {msg}\n", file=sys.stderr)
-    sys.exit(code)
-
-
-def info(msg: str = "") -> None:
-    print(msg, file=sys.stderr)
+# Console output should never crash on exotic codepages (Task Scheduler logs, etc.)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
 
 
-def private_dir(path: Path) -> Path:
-    """Create a directory only the current user can read."""
-    path.mkdir(parents=True, exist_ok=True)
+# --------------------------------------------------------------------------- #
+# Sanitizers -- everything coming back from Garmin is treated as untrusted.
+# --------------------------------------------------------------------------- #
+def clean_text(value, limit=100):
+    """Strip control characters and newlines, cap length. For display/notes."""
+    if value is None:
+        return None
+    s = re.sub(r"[\x00-\x1f\x7f]", " ", str(value)).strip()
+    return (s[:limit] + "...") if len(s) > limit else s
+
+
+def fs_name(value, limit=40):
+    """Reduce a string to a safe filename component (allowlist only)."""
+    s = re.sub(r"[^A-Za-z0-9_-]", "_", str(value or ""))
+    return s[:limit] or "unknown"
+
+
+def valid_day(value):
+    """Return YYYY-MM-DD if it looks like one, else 'unknown-date'."""
+    s = str(value or "")[:10]
+    return s if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s) else "unknown-date"
+
+
+def contained_path(base: Path, *parts) -> Path:
+    """Join parts under base and refuse anything that escapes base."""
+    p = base.joinpath(*parts).resolve()
+    if not p.is_relative_to(base.resolve()):
+        raise ValueError("path escape blocked")
+    return p
+
+
+def restrict_perms(path: Path) -> None:
+    """chmod 700 (dir) / 600 (file). No-op on Windows (uses ACLs instead)."""
     try:
-        path.chmod(stat.S_IRWXU)  # 0700
-    except OSError:
-        pass  # Windows / odd filesystems: best effort
-    return path
-
-
-def private_write(path: Path, text: str) -> None:
-    """Write a file only the current user can read."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Create with restrictive permissions before any bytes land in it.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    try:
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
+        os.chmod(path, 0o700 if path.is_dir() else 0o600)
     except OSError:
         pass
 
 
-def import_garmin():
-    try:
-        from garminconnect import Garmin  # noqa: WPS433 (deliberate late import)
-    except ImportError:
-        die(
-            "the garminconnect library is not installed.\n"
-            "  Run:  pip install -r requirements.txt\n"
-            "  (Windows:  py -m pip install -r requirements.txt)"
-        )
-    return Garmin
+def write_private(path: Path, text: str) -> None:
+    """Write a secret to disk that is owner-only from the moment it exists.
 
-
-def warn_about_password_env() -> None:
-    leaked = [name for name in FORBIDDEN_PASSWORD_ENV if os.environ.get(name)]
-    if leaked:
-        info(
-            "Note: ignoring "
-            + ", ".join(leaked)
-            + ". This script never takes your password from the environment."
-            "\n      Unset it so it does not sit in your shell history or process list."
-        )
-
-
-def slugify(text: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
-    return slug[:60] or "activity"
-
-
-def fmt_duration(seconds) -> str:
-    if not seconds:
-        return ""
-    seconds = int(seconds)
-    hours, rem = divmod(seconds, 3600)
-    minutes, secs = divmod(rem, 60)
-    if hours:
-        return f"{hours}h {minutes:02d}m {secs:02d}s"
-    return f"{minutes}m {secs:02d}s"
-
-
-def fmt_pace(meters_per_second) -> str:
-    if not meters_per_second:
-        return ""
-    secs_per_km = 1000.0 / float(meters_per_second)
-    minutes, secs = divmod(int(round(secs_per_km)), 60)
-    return f"{minutes}:{secs:02d} /km"
-
-
-def first_number(*values):
-    """Return the first value that is a real number (0 counts, None does not)."""
-    for value in values:
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return value
-    return None
-
-
-def safe(label: str, fn, *args):
-    """Call a Garmin endpoint, and shrug politely if it is unavailable.
-
-    Garmin returns nothing for days you did not wear the watch, and
-    occasionally 404s an endpoint your device does not support. Neither is
-    worth crashing a morning sync over.
+    Deliberately not path.write_text(): that creates the file with the process
+    umask (usually world-readable) and would leave a window before any chmod.
     """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    restrict_perms(path)
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def safe(fn, *args):
+    """Call an API getter; tolerate one bad endpoint, but STOP the whole run on
+    auth/rate-limit problems so we never overwrite good notes with n/a."""
     try:
         return fn(*args)
-    except Exception as exc:  # noqa: BLE001 - any endpoint hiccup is non-fatal
-        info(f"  (skipped {label}: {type(exc).__name__})")
+    except (GarminConnectAuthenticationError, GarminConnectTooManyRequestsError) as exc:
+        sys.exit(
+            f"Stopping: {type(exc).__name__}.\n"
+            f"Either the saved token expired (run: {CMD} --login) "
+            "or Garmin is rate-limiting (wait an hour and try again)."
+        )
+    except Exception as exc:  # noqa: BLE001 -- one bad endpoint becomes a gap, not a crash
+        print(f"    (skipped {fn.__name__}: {type(exc).__name__})", file=sys.stderr)
         return None
 
 
-# --------------------------------------------------------------------------
-# login
-# --------------------------------------------------------------------------
+def dig(obj, *keys, default=None):
+    """Nested .get() that tolerates None, missing keys, and list indices."""
+    for key in keys:
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            obj = obj.get(key)
+        elif isinstance(obj, list) and isinstance(key, int) and len(obj) > key:
+            obj = obj[key]
+        else:
+            return default
+    return obj if obj is not None else default
 
-def cmd_login() -> int:
-    """One-time interactive login. The only step that ever asks for a password."""
-    Garmin = import_garmin()
-    warn_about_password_env()
 
+def fmt(value, suffix="", divisor=1, digits=None):
+    if value is None:
+        return "n/a"
+    if divisor != 1:
+        value = value / divisor
+    if digits is not None:
+        value = round(value, digits)
+        if digits == 0:
+            value = int(value)
+    elif isinstance(value, float) and value.is_integer():
+        # Garmin hands back 48.0 as often as 48; a resting HR should not
+        # render as "48.0 bpm".
+        value = int(value)
+    return f"{value}{suffix}"
+
+
+def hms(seconds):
+    if seconds is None:
+        return "n/a"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m = rem // 60
+    return f"{h}:{m:02d} h" if h else f"{m} min"
+
+
+# --------------------------------------------------------------------------- #
+# Auth -- password is only ever entered here, into a hidden prompt.
+# --------------------------------------------------------------------------- #
+def do_login(token_dir: Path) -> None:
     if not sys.stdin.isatty():
-        die(
-            "--login needs a real terminal so your password can be hidden as you\n"
-            "type it. Run it from Terminal (Mac) or PowerShell/cmd (Windows),\n"
-            "not from a pipe, an editor's output pane, or a CI job."
+        sys.exit(
+            "Run --login from a real terminal (Terminal on macOS, PowerShell or "
+            "cmd on Windows) -- not an IDE console, Git Bash, or a pipe. Your "
+            "password cannot be hidden here."
         )
-
-    info("Garmin login (one time only).")
-    info("Your password is hidden as you type and is never stored or printed.\n")
-
+    print("Garmin Connect one-time login (nothing is stored or echoed).")
     email = input("Garmin email: ").strip()
-    if not email:
-        die("no email entered.")
-
-    try:
-        with warnings.catch_warnings():
-            # getpass only *warns* when it has to fall back to echoing your
-            # keystrokes. Make that a hard stop instead.
-            warnings.simplefilter("error", getpass.GetPassWarning)
+    with warnings.catch_warnings():
+        # getpass warns if it has to fall back to echoing the password; turn that
+        # warning into a hard stop so a password can never appear on screen.
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
             password = getpass.getpass("Garmin password (hidden): ")
-    except getpass.GetPassWarning:
-        die("this terminal cannot hide your password as you type. Refusing to continue.")
-    except (EOFError, KeyboardInterrupt):
-        die("cancelled.")
-    if not password:
-        die("no password entered.")
+        except getpass.GetPassWarning:
+            sys.exit("This terminal cannot hide your password. Use PowerShell/Terminal instead.")
 
-    garmin = Garmin(email=email, password=password, is_cn=False, return_on_mfa=True)
+    def prompt_mfa():
+        return input("2FA code from Garmin (if asked): ").strip()
 
+    token_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    restrict_perms(token_dir)
+
+    api = Garmin(email=email, password=password, prompt_mfa=prompt_mfa)
     try:
-        result, state = garmin.login()
-        if result == "needs_mfa":
-            code = input("Garmin sent you a code. Enter it here: ").strip()
-            if not code:
-                die("no code entered.")
-            garmin.resume_login(state, code)
-    except Exception as exc:  # noqa: BLE001
-        die(f"Garmin refused the login ({type(exc).__name__}: {exc})")
-    finally:
-        # Drop the password from memory as soon as it is no longer needed.
-        del password
+        api.login()                 # fresh credential login (handles 2FA)
+        api.garth.dump(str(token_dir))  # persist tokens so we never ask again
+    except Exception as exc:  # noqa: BLE001 -- never dump a traceback next to a password prompt
+        sys.exit(f"Login failed ({type(exc).__name__}). Check email, password and 2FA code.")
 
-    private_dir(TOKEN_DIR)
-    garmin.garth.dump(str(TOKEN_DIR))
-    for child in TOKEN_DIR.iterdir():
-        try:
-            child.chmod(stat.S_IRUSR | stat.S_IWUSR)
-        except OSError:
-            pass
-
-    info("")
-    info(f"Logged in. Token saved privately to {TOKEN_DIR} (not printed, good for ~1 year).")
-    info("Next:  python sync_garmin.py --days 3 --dry-run")
-    return 0
+    for f in token_dir.iterdir():
+        restrict_perms(f)
+    print(f"Login OK. Token saved privately to {token_dir}.")
+    print("You won't need your password again until the token expires (~1 year).")
+    print(f"Using GitHub Actions? Run: {CMD} --export-ci-token")
 
 
-def cmd_export_ci_token() -> int:
-    """Write the token bundle to a file, for pasting into a GitHub secret.
+def resume(token_dir: Path) -> Garmin:
+    """Load the saved token. No password, no 2FA, no prompts."""
+    api = Garmin()
+    api.login(str(token_dir))
+    return api
 
-    Only needed for Path A (GitHub Actions). Local users never run this.
+
+def export_ci_token(token_dir: Path) -> None:
+    """Write the token bundle to a file for a GitHub Actions secret.
+
+    We write to a file (perms 600) instead of printing, so a year of account
+    access never lands in terminal scrollback. Delete the file after you paste
+    it into your CI secret.
     """
-    Garmin = import_garmin()
+    import io
+    import tarfile
 
-    if not TOKEN_DIR.exists():
-        die("no saved token found. Run:  python sync_garmin.py --login")
+    if not token_dir.exists() or not any(token_dir.iterdir()):
+        sys.exit(f"No saved token in {token_dir}. Run: {CMD} --login")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(str(token_dir), arcname=".")
+    blob = base64.b64encode(buf.getvalue()).decode()
 
-    garmin = Garmin()
-    try:
-        garmin.login(str(TOKEN_DIR))
-        bundle = garmin.garth.dumps()
-    except Exception as exc:  # noqa: BLE001
-        die(f"could not read the saved token ({type(exc).__name__}). Re-run --login.")
-
-    private_write(CI_TOKEN_FILE, bundle)
-    info(f"Wrote {CI_TOKEN_FILE} (owner-only).")
-    info("")
-    info("This file IS a login credential. Paste its contents into your")
-    info("GARMIN_TOKEN_B64 GitHub secret, then delete the file:")
-    info(f"  rm {CI_TOKEN_FILE}")
-    info("Never commit it, never paste it into a chat.")
-    return 0
+    out = Path.cwd() / "garmin-ci-token.txt"
+    write_private(out, blob)
+    print(f"CI token written to: {out}")
+    print("Paste its contents into your GARMIN_TOKEN_B64 GitHub secret, then DELETE this file.")
+    print("Anyone who gets this file has ~1 year of access to your Garmin data.")
 
 
-def connect():
-    """Log in from the saved token (local) or GARMIN_TOKEN_B64 (CI)."""
-    Garmin = import_garmin()
-    garmin = Garmin()
-
-    ci_token = os.environ.get("GARMIN_TOKEN_B64", "").strip()
-    if ci_token:
-        if len(ci_token) < 512:
-            die(
-                "GARMIN_TOKEN_B64 looks truncated. Paste the whole contents of\n"
-                "garmin-ci-token.txt into the secret, with no line breaks trimmed."
-            )
-        try:
-            garmin.login(ci_token)
-            return garmin
-        except Exception as exc:  # noqa: BLE001
-            die(
-                f"GARMIN_TOKEN_B64 was rejected ({type(exc).__name__}). It has probably\n"
-                "expired. Re-run --login, then --export-ci-token, and update the secret."
-            )
-
-    if not TOKEN_DIR.exists():
-        die("not logged in yet. Run:  python sync_garmin.py --login")
-
-    try:
-        garmin.login(str(TOKEN_DIR))
-    except Exception as exc:  # noqa: BLE001
-        die(
-            f"the saved login token no longer works ({type(exc).__name__}).\n"
-            "Tokens last about a year. Run:  python sync_garmin.py --login"
-        )
-    return garmin
-
-
-# --------------------------------------------------------------------------
-# fetching
-# --------------------------------------------------------------------------
-
-def fetch_wellness(garmin, day: date) -> dict:
-    """One day of recovery numbers, flattened into plain fields."""
-    iso = day.isoformat()
-    info(f"  wellness {iso}")
-
-    summary = safe("daily summary", garmin.get_user_summary, iso) or {}
-    sleep = safe("sleep", garmin.get_sleep_data, iso) or {}
-    hrv = safe("hrv", garmin.get_hrv_data, iso) or {}
-    readiness = safe("training readiness", garmin.get_training_readiness, iso)
-
-    sleep_dto = (sleep or {}).get("dailySleepDTO") or {}
-    sleep_seconds = first_number(
-        sleep_dto.get("sleepTimeSeconds"),
-        summary.get("sleepingSeconds"),
-    )
-    sleep_scores = sleep_dto.get("sleepScores") or {}
-    sleep_score = first_number(
-        (sleep_scores.get("overall") or {}).get("value"),
-        sleep_dto.get("sleepScore"),
-    )
-
-    hrv_summary = (hrv or {}).get("hrvSummary") or {}
-    hrv_avg = first_number(
-        hrv_summary.get("lastNightAvg"),
-        sleep_dto.get("avgOvernightHrv"),
-        (sleep or {}).get("avgOvernightHrv"),
-    )
-
-    if isinstance(readiness, list) and readiness:
-        readiness_score = first_number(readiness[0].get("score"))
-    elif isinstance(readiness, dict):
-        readiness_score = first_number(readiness.get("score"))
-    else:
-        readiness_score = None
+# --------------------------------------------------------------------------- #
+# Pull + map (defensive: payloads vary by device/firmware, missing -> None)
+# --------------------------------------------------------------------------- #
+def pull_wellness(api: Garmin, day: str) -> dict:
+    stats = safe(api.get_stats, day)
+    sleep = safe(api.get_sleep_data, day)
+    hrv = safe(api.get_hrv_data, day)
+    readiness = safe(api.get_training_readiness, day)
 
     return {
-        "date": iso,
-        "resting_hr": first_number(summary.get("restingHeartRate")),
-        "hrv_overnight_ms": hrv_avg,
-        "hrv_status": hrv_summary.get("status"),
-        "sleep_hours": round(sleep_seconds / 3600.0, 1) if sleep_seconds else None,
-        "sleep_score": sleep_score,
-        "body_battery_low": first_number(summary.get("bodyBatteryLowestValue")),
-        "body_battery_high": first_number(summary.get("bodyBatteryHighestValue")),
-        "stress_avg": first_number(summary.get("averageStressLevel")),
-        "steps": first_number(summary.get("totalSteps")),
-        "training_readiness": readiness_score,
-        "calories_total": first_number(summary.get("totalKilocalories")),
+        "day": day,
+        "resting_hr": dig(stats, "restingHeartRate"),
+        "steps": dig(stats, "totalSteps"),
+        "stress_avg": dig(stats, "averageStressLevel"),
+        "body_battery_low": dig(stats, "bodyBatteryLowestValue"),
+        "body_battery_high": dig(stats, "bodyBatteryHighestValue"),
+        "active_kcal": dig(stats, "activeKilocalories"),
+        "sleep_seconds": dig(sleep, "dailySleepDTO", "sleepTimeSeconds"),
+        "sleep_score": dig(sleep, "dailySleepDTO", "sleepScores", "overall", "value"),
+        "hrv_ms": dig(hrv, "hrvSummary", "lastNightAvg"),
+        "hrv_status": clean_text(dig(hrv, "hrvSummary", "status"), 30),
+        "training_readiness": dig(readiness, 0, "score"),
+        "training_readiness_level": clean_text(dig(readiness, 0, "level"), 30),
+        "raw": {"stats": stats, "sleep": sleep, "hrv": hrv, "readiness": readiness},
     }
 
 
-def fetch_activities(garmin, start: date, end: date) -> list:
-    info(f"  activities {start} .. {end}")
-    raw = safe(
-        "activities",
-        garmin.get_activities_by_date,
-        start.isoformat(),
-        end.isoformat(),
-    ) or []
-
-    activities = []
-    for item in raw:
-        type_key = ((item.get("activityType") or {}).get("typeKey") or "").lower()
-        distance_m = first_number(item.get("distance"))
-        speed = first_number(item.get("averageSpeed"))
-        elevation = first_number(item.get("elevationGain"))
-        activities.append(
-            {
-                "id": str(item.get("activityId")),
-                "name": item.get("activityName") or type_key or "Activity",
-                "type": type_key or "unknown",
-                "start_local": item.get("startTimeLocal"),
-                "date": (item.get("startTimeLocal") or "")[:10],
-                "distance_km": round(distance_m / 1000.0, 2) if distance_m else None,
-                "duration_seconds": first_number(item.get("duration")),
-                "avg_hr": first_number(item.get("averageHR")),
-                "max_hr": first_number(item.get("maxHR")),
-                "avg_speed_mps": speed,
-                "elevation_gain_m": round(elevation) if elevation is not None else None,
-                "calories": first_number(item.get("calories")),
-                "aerobic_training_effect": first_number(item.get("aerobicTrainingEffect")),
-                "anaerobic_training_effect": first_number(item.get("anaerobicTrainingEffect")),
-            }
-        )
-    activities.sort(key=lambda a: a.get("start_local") or "")
-    return activities
+def has_data(w: dict) -> bool:
+    return any(v is not None for k, v in w.items() if k not in ("day", "raw"))
 
 
-def fetch(garmin, days: int):
-    today = date.today()
-    start = today - timedelta(days=days - 1)
-    info(f"Pulling {days} day(s): {start} .. {today}")
-    activities = fetch_activities(garmin, start, today)
-    wellness = [fetch_wellness(garmin, start + timedelta(days=n)) for n in range(days)]
-    return activities, wellness
+def pull_activities(api: Garmin, start: str, end: str) -> list:
+    acts = safe(api.get_activities_by_date, start, end) or []
+    out = []
+    for a in acts:
+        item = {
+            "id": dig(a, "activityId"),
+            "name": clean_text(dig(a, "activityName")),
+            "type": clean_text(dig(a, "activityType", "typeKey"), 40),
+            "start_local": clean_text(dig(a, "startTimeLocal") or dig(a, "startTimeGMT"), 30),
+            "distance_m": dig(a, "distance"),
+            "duration_s": dig(a, "duration"),
+            "avg_hr": dig(a, "averageHR"),
+            "max_hr": dig(a, "maxHR"),
+            "elev_gain_m": dig(a, "elevationGain"),
+            "calories": dig(a, "calories"),
+            "training_effect": dig(a, "aerobicTrainingEffect"),
+            "raw": a,
+        }
+        if item["id"] is None:
+            # stable fallback key so two id-less activities never collide
+            seed = f"{item['name']}|{item['start_local']}".encode("utf-8")
+            item["id"] = "x" + hashlib.sha1(seed).hexdigest()[:10]
+        out.append(item)
+    return out
 
 
-# --------------------------------------------------------------------------
-# rendering
-# --------------------------------------------------------------------------
-
-def wellness_markdown(day: dict) -> str:
-    lines = [f"# Garmin wellness {day['date']}"]
-
-    def add(label, value, suffix=""):
-        if value is not None:
-            lines.append(f"- {label}: {value}{suffix}")
-
-    add("Resting HR", day["resting_hr"], " bpm")
-    if day["hrv_overnight_ms"] is not None:
-        raw_status = day.get("hrv_status")
-        status = f" ({str(raw_status).lower()})" if raw_status else ""
-        lines.append(f"- HRV (overnight): {day['hrv_overnight_ms']} ms{status}")
-    if day["sleep_hours"] is not None:
-        score = f" (score {day['sleep_score']})" if day["sleep_score"] is not None else ""
-        lines.append(f"- Sleep: {day['sleep_hours']} h{score}")
-    if day["body_battery_low"] is not None and day["body_battery_high"] is not None:
-        lines.append(
-            f"- Body battery: {day['body_battery_low']} -> {day['body_battery_high']}"
-        )
-    add("Stress (avg)", day["stress_avg"])
-    add("Steps", day["steps"])
-    add("Training readiness", day["training_readiness"])
-
-    if len(lines) == 1:
-        lines.append("- No data recorded (watch not worn?)")
-    return "\n".join(lines) + "\n"
+# --------------------------------------------------------------------------- #
+# Rendering (all untrusted strings pass clean_text; names go in code spans)
+# --------------------------------------------------------------------------- #
+def render_daily(w: dict) -> str:
+    sleep_h = w["sleep_seconds"] / 3600 if w.get("sleep_seconds") else None
+    return "\n".join([
+        f"# Garmin wellness {w['day']}",
+        "",
+        f"- Resting HR: {fmt(w['resting_hr'], ' bpm')}",
+        f"- HRV (overnight): {fmt(w['hrv_ms'], ' ms')} ({w['hrv_status'] or 'n/a'})",
+        f"- Sleep: {fmt(sleep_h, ' h', digits=1)} (score {fmt(w['sleep_score'])})",
+        f"- Body battery: {fmt(w['body_battery_low'])} -> {fmt(w['body_battery_high'])}",
+        f"- Stress (avg): {fmt(w['stress_avg'])}",
+        f"- Steps: {fmt(w['steps'])}",
+        f"- Training readiness: {fmt(w['training_readiness'])} ({w['training_readiness_level'] or 'n/a'})",
+        f"- Active kcal: {fmt(w['active_kcal'])}",
+        "",
+    ])
 
 
-def activity_markdown(act: dict) -> str:
-    lines = [f"# {act['name']}"]
-
-    def add(label, value, suffix=""):
-        if value not in (None, ""):
-            lines.append(f"- {label}: {value}{suffix}")
-
-    add("Date", (act.get("start_local") or "").replace("T", " ")[:16])
-    add("Type", act["type"])
-    add("Distance", act["distance_km"], " km")
-    add("Duration", fmt_duration(act["duration_seconds"]))
-    if act["avg_hr"] is not None:
-        max_hr = f" (max {act['max_hr']})" if act["max_hr"] is not None else ""
-        lines.append(f"- Avg HR: {act['avg_hr']} bpm{max_hr}")
-    if act["avg_speed_mps"]:
-        if any(word in act["type"] for word in ("run", "walk", "hik")):
-            add("Avg pace", fmt_pace(act["avg_speed_mps"]))
-        else:
-            add("Avg speed", round(act["avg_speed_mps"] * 3.6, 1), " km/h")
-    add("Elevation gain", act["elevation_gain_m"], " m")
-    add("Calories", act["calories"])
-    if act["aerobic_training_effect"] is not None:
-        anaerobic = act["anaerobic_training_effect"]
-        tail = f", anaerobic {anaerobic}" if anaerobic is not None else ""
-        lines.append(f"- Training effect: aerobic {act['aerobic_training_effect']}{tail}")
-
-    return "\n".join(lines) + "\n"
+def render_activity(a: dict, day: str) -> str:
+    mi = fmt(a["distance_m"], " mi", divisor=1609.34, digits=2)
+    ft = fmt(a["elev_gain_m"], " ft", divisor=0.3048, digits=0) if a["elev_gain_m"] else "n/a"
+    pace = ""
+    if a["distance_m"] and a["duration_s"] and a["distance_m"] > 0:
+        sec_per_mi = a["duration_s"] / (a["distance_m"] / 1609.34)
+        pace = f"\n- Pace: {int(sec_per_mi // 60)}:{int(sec_per_mi % 60):02d} /mi"
+    return "\n".join([
+        f"# Garmin activity {day} ({a['type'] or 'unknown'})",
+        "",
+        f"- Name: `{(a['name'] or 'Activity').replace('`', '')}`",
+        f"- Start: {a['start_local'] or 'n/a'}",
+        f"- Distance: {mi}",
+        f"- Duration: {hms(a['duration_s'])}" + pace,
+        f"- Avg HR: {fmt(a['avg_hr'], ' bpm', digits=0)} (max {fmt(a['max_hr'], '', digits=0)})",
+        f"- Elevation gain: {ft}",
+        f"- Training effect: {fmt(a['training_effect'], '', digits=1)}",
+        f"- Calories: {fmt(a['calories'], '', digits=0)}",
+        "",
+    ])
 
 
-# --------------------------------------------------------------------------
-# sinks
-# --------------------------------------------------------------------------
-
-def sink_files(out: Path, activities: list, wellness: list) -> None:
-    """Write the garmin/ folder: one note per day, one per workout, plus data.json."""
-    daily_dir = out / "daily"
-    activity_dir = out / "activities"
-    daily_dir.mkdir(parents=True, exist_ok=True)
-    activity_dir.mkdir(parents=True, exist_ok=True)
-
-    for day in wellness:
-        (daily_dir / f"{day['date']}.md").write_text(
-            wellness_markdown(day), encoding="utf-8"
-        )
-
-    for act in activities:
-        day = act.get("date") or "undated"
-        name = f"{day}-{slugify(act['name'])}-{act['id']}.md"
-        (activity_dir / name).write_text(activity_markdown(act), encoding="utf-8")
-
-    # data.json is cumulative: merge this run into whatever is already there.
-    store_path = out / "data.json"
-    store = {"activities": {}, "wellness": {}}
-    if store_path.exists():
-        try:
-            existing = json.loads(store_path.read_text(encoding="utf-8"))
-            store["activities"] = existing.get("activities") or {}
-            store["wellness"] = existing.get("wellness") or {}
-        except (ValueError, OSError):
-            info("  (existing data.json was unreadable; starting a fresh one)")
-
-    for act in activities:
-        store["activities"][act["id"]] = act
-    for day in wellness:
-        store["wellness"][day["date"]] = day
-    store["updated_at"] = datetime.now().isoformat(timespec="seconds")
-
-    store_path.write_text(json.dumps(store, indent=2, sort_keys=True), encoding="utf-8")
-
-    info("")
-    info(f"Wrote {len(wellness)} daily note(s) and {len(activities)} workout note(s) to {out}/")
-    info(f"Point your AI coach at {out}/ and it has your recovery context.")
-
-
-def sink_supabase(activities: list, wellness: list) -> None:
-    """POST {activities, wellness} to your own ingest endpoint."""
+# --------------------------------------------------------------------------- #
+# Sinks
+# --------------------------------------------------------------------------- #
+def load_store(store_path: Path) -> dict:
+    fresh = {"wellness": {}, "activities": {}, "last_sync": None}
+    if not store_path.exists():
+        return fresh
     try:
-        import requests
-    except ImportError:
-        die("the requests library is not installed. Run: pip install -r requirements.txt")
+        store = json.loads(store_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        print("  (existing data.json unreadable -- starting fresh)")
+        return fresh
+    if (
+        not isinstance(store, dict)
+        or not isinstance(store.get("wellness"), dict)
+        or not isinstance(store.get("activities"), dict)
+    ):
+        print("  (existing data.json has unexpected shape -- starting fresh)")
+        return fresh
+    return store
 
-    url = os.environ.get("GARMIN_INGEST_URL", "").strip()
-    secret = os.environ.get("GARMIN_INGEST_SECRET", "").strip()
-    if not url:
-        die("--sink supabase needs GARMIN_INGEST_URL set to your endpoint.")
-    if not url.lower().startswith("https://"):
-        die("GARMIN_INGEST_URL must be https:// - refusing to send your data in the clear.")
 
-    headers = {"Content-Type": "application/json"}
-    if secret:
-        headers["Authorization"] = f"Bearer {secret}"
+def sink_files(wellness: list, activities: list, out_dir: Path, dry_run: bool) -> None:
+    store_path = out_dir / "data.json"
+    store = load_store(store_path)
 
-    response = requests.post(
+    for w in wellness:
+        if not has_data(w):
+            print(f"  {w['day']} (no data -- skipped, existing note kept)")
+            continue
+        store["wellness"][w["day"]] = w
+        note = render_daily(w)
+        if dry_run:
+            print(note)
+        else:
+            path = contained_path(out_dir, "daily", f"{w['day']}.md")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(note, encoding="utf-8")
+
+    for a in activities:
+        day = valid_day(a["start_local"])
+        print(f"  {day}  {a['type'] or '?'}  {a['name'] or ''}")
+        store["activities"][str(a["id"])] = a
+        note = render_activity(a, day)
+        if dry_run:
+            print(note)
+        else:
+            fname = f"{day}-{fs_name(a['type'])}-{fs_name(a['id'], 20)}.md"
+            try:
+                path = contained_path(out_dir, "activities", fname)
+            except ValueError:
+                print("    (unsafe filename blocked)")
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(note, encoding="utf-8")
+
+    if not dry_run:
+        store["last_sync"] = datetime.now().isoformat(timespec="seconds")
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        store_path.write_text(json.dumps(store, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        print(f"Done. Output in {out_dir}")
+    else:
+        print("Dry run -- nothing written.")
+
+
+def sink_supabase(wellness: list, activities: list) -> None:
+    import requests
+
+    url = os.environ.get("GARMIN_INGEST_URL")
+    secret = os.environ.get("GARMIN_INGEST_SECRET") or os.environ.get("SESSION_LOG_SECRET")
+    if not url or not secret:
+        sys.exit("--sink supabase needs GARMIN_INGEST_URL and GARMIN_INGEST_SECRET.")
+    resp = requests.post(
         url,
         json={"activities": activities, "wellness": wellness},
-        headers=headers,
-        timeout=30,
+        headers={"Authorization": f"Bearer {secret}"},
+        timeout=60,
     )
-    if response.status_code >= 400:
-        die(f"your endpoint returned HTTP {response.status_code}: {response.text[:300]}")
-
-    info("")
-    info(
-        f"Sent {len(activities)} activity record(s) and {len(wellness)} wellness "
-        f"record(s) to your endpoint (HTTP {response.status_code})."
-    )
+    resp.raise_for_status()
+    print(f"ingest OK: {resp.status_code}")
 
 
-def print_preview(activities: list, wellness: list) -> None:
-    print()
-    for day in wellness:
-        print(wellness_markdown(day))
-    if activities:
-        for act in activities:
-            print(activity_markdown(act))
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def run_sync(api: Garmin, days: int, sink: str, out_dir: Path, dry_run: bool) -> None:
+    today = date.today()
+    start = (today - timedelta(days=days - 1)).isoformat()
+    end = today.isoformat()
+
+    print(f"Pulling {days} day(s): {start} .. {end}")
+    wellness = [pull_wellness(api, (today - timedelta(days=i)).isoformat()) for i in range(days)]
+    activities = pull_activities(api, start, end)
+    print(f"Pulled {len(activities)} activities, {len(wellness)} wellness day(s).")
+
+    if sink == "supabase":
+        if dry_run:
+            print(json.dumps({"wellness": wellness, "activities": activities}, indent=2, default=str))
+            print("Dry run -- nothing sent.")
+            return
+        sink_supabase(wellness, activities)
     else:
-        print("(no activities in this window)\n")
-    print("Dry run: nothing was written. Drop --dry-run to save these.")
+        sink_files(wellness, activities, out_dir, dry_run)
 
 
-# --------------------------------------------------------------------------
-# entry point
-# --------------------------------------------------------------------------
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Pull your own Garmin activities and recovery data. Read-only.",
-        epilog="First run:  python sync_garmin.py --login",
-    )
-    parser.add_argument(
-        "--login",
-        action="store_true",
-        help="one-time interactive login (asks for email, hidden password, 2FA code)",
-    )
-    parser.add_argument(
-        "--export-ci-token",
-        action="store_true",
-        help="write the token bundle to garmin-ci-token.txt for a GitHub secret (Path A only)",
-    )
-    parser.add_argument("--days", type=int, default=3, help="how many days back to pull (default 3)")
-    parser.add_argument(
-        "--sink",
-        choices=("files", "supabase"),
-        default="files",
-        help="files: write markdown notes. supabase: POST to your own endpoint.",
-    )
-    parser.add_argument("--out", default="./garmin", help="output folder for --sink files")
-    parser.add_argument("--dry-run", action="store_true", help="print what would be saved, save nothing")
-    return parser
-
-
-def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+def main() -> None:
+    p = argparse.ArgumentParser(description="Read-only Garmin Connect sync.")
+    p.add_argument("--login", action="store_true", help="one-time interactive login")
+    p.add_argument("--export-ci-token", action="store_true", help="write CI token bundle to a file (Path A)")
+    p.add_argument("--days", type=int, default=3, help=f"days back to pull (1-{MAX_DAYS}, default 3)")
+    p.add_argument("--sink", choices=["files", "supabase"], default="files")
+    p.add_argument("--out", type=Path, default=DEFAULT_OUT_DIR, help="output dir for --sink files")
+    p.add_argument("--tokens", type=Path, default=DEFAULT_TOKEN_DIR, help="token directory")
+    p.add_argument("--dry-run", action="store_true", help="print instead of writing/sending")
+    args = p.parse_args()
 
     if args.login:
-        return cmd_login()
+        do_login(args.tokens)
+        return
     if args.export_ci_token:
-        return cmd_export_ci_token()
+        export_ci_token(args.tokens)
+        return
 
-    if args.days < 1:
-        die("--days must be at least 1.")
-    warn_about_password_env()
+    days = max(1, min(args.days, MAX_DAYS))
+    if days != args.days:
+        print(f"--days limited to {days} (protects against rate-limiting).")
 
-    garmin = connect()
-    activities, wellness = fetch(garmin, args.days)
+    try:
+        api = resume(args.tokens)
+    except GarminConnectAuthenticationError:
+        sys.exit(f"No valid saved token in {args.tokens}.\nRun: {CMD} --login")
+    except (GarminConnectConnectionError, OSError) as exc:
+        sys.exit(
+            f"Could not reach Garmin ({type(exc).__name__}). This looks like a "
+            "network problem, NOT a login problem -- do not re-enter your "
+            "password. Try again later."
+        )
+    except Exception as exc:  # noqa: BLE001
+        sys.exit(
+            f"Unexpected error loading the saved token ({type(exc).__name__}).\n"
+            f"If this persists, run: {CMD} --login"
+        )
 
-    if args.dry_run:
-        print_preview(activities, wellness)
-    elif args.sink == "files":
-        sink_files(Path(args.out), activities, wellness)
-    else:
-        sink_supabase(activities, wellness)
-    return 0
+    run_sync(api, days, args.sink, args.out, args.dry_run)
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        info("\nCancelled.")
-        sys.exit(130)
+    main()

