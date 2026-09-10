@@ -21,7 +21,7 @@ The script here is a thin wrapper around it. Full library and docs:
 > stored, never put in an environment variable, never left in your command
 > history, and never printed. Your year-long login token is saved privately and
 > never shown on screen. The script even refuses to run where your password
-> can't be hidden. Read it top to bottom if you want -- it's about 580 lines,
+> can't be hidden. Read it top to bottom if you want -- it's about 600 lines,
 > comments and all.
 
 ## The easy way: paste this into Claude Code and let it build everything
