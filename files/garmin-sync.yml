@@ -1,0 +1,78 @@
+# Path A: run the sync in the cloud every morning.
+#
+# Copy this file to .github/workflows/garmin-sync.yml in your own repo, with
+# sync_garmin.py and requirements.txt at the repo root.
+#
+# Repo settings > Secrets and variables > Actions, add:
+#   GARMIN_TOKEN_B64     contents of garmin-ci-token.txt (from --export-ci-token)
+#   GARMIN_INGEST_URL    your https ingest endpoint   (skip if using files mode)
+#   SESSION_LOG_SECRET   the shared secret it checks  (skip if using files mode)
+#
+# Then open the Actions tab and click "Run workflow" once to confirm a green run.
+
+name: Garmin sync
+
+on:
+  schedule:
+    # 12:00 UTC daily. Cron here is always UTC, so pick the UTC time that
+    # lands in your morning (12:00 UTC = 5am PT / 8am ET / 1pm UK).
+    - cron: "0 12 * * *"
+  workflow_dispatch: {}
+
+# Never let two syncs overlap.
+concurrency:
+  group: garmin-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # Read-only against your own repo; nothing is pushed back by default.
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Pull Garmin data
+        env:
+          # The yearly login token. Re-run --login and --export-ci-token when
+          # it expires or your Garmin password changes.
+          GARMIN_TOKEN_B64: ${{ secrets.GARMIN_TOKEN_B64 }}
+          GARMIN_INGEST_URL: ${{ secrets.GARMIN_INGEST_URL }}
+          GARMIN_INGEST_SECRET: ${{ secrets.SESSION_LOG_SECRET }}
+        # 3 days, not 1: Garmin backfills sleep and HRV for a night or two,
+        # and re-running a day simply overwrites it.
+        run: python sync_garmin.py --days 3 --sink supabase
+
+      # --- Files mode instead of a database -------------------------------
+      #
+      # If you have no ingest endpoint, replace the step above with:
+      #
+      #   run: python sync_garmin.py --days 3 --sink files --out ./garmin
+      #
+      # and uncomment the step below to commit the notes back to this repo.
+      #
+      # Think about this one first: it puts your sleep, HRV and resting heart
+      # rate in a git repo. Fine in a PRIVATE repo you own. Do not do it in a
+      # public one. Path B (local cron) keeps the data on your own machine.
+      #
+      # You also need to raise the job's permissions above to:
+      #   permissions:
+      #     contents: write
+      #
+      # - name: Commit the notes
+      #   run: |
+      #     git config user.name "garmin-sync"
+      #     git config user.email "garmin-sync@users.noreply.github.com"
+      #     git add garmin
+      #     git diff --staged --quiet || git commit -m "Garmin sync $(date -u +%F)"
+      #     git push

@@ -1,0 +1,14 @@
+# Credentials. Never commit these.
+garmin-ci-token.txt
+.garminconnect/
+*token*.json
+
+# Your own health data, if you run the script from inside this folder.
+garmin/
+data.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

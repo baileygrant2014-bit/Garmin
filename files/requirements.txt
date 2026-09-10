@@ -1,0 +1,10 @@
+# Everything sync_garmin.py needs.
+#   pip install -r requirements.txt
+# (On Windows, if pip is not found: py -m pip install -r requirements.txt)
+
+# The unofficial Garmin Connect client this whole thing is built on.
+# https://github.com/cyberjunky/python-garminconnect
+garminconnect>=0.2.25
+
+# Used only by --sink supabase, to POST your data to your own endpoint.
+requests>=2.31.0
