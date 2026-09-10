@@ -23,7 +23,7 @@ The script here is a thin wrapper around it. Full library and docs:
 > never shown on screen. The script even refuses to run where your password
 > can't be hidden. Everything Garmin sends back is treated as untrusted and
 > sanitized before it reaches a filename or a note. Read it top to bottom if
-> you want -- it's about 490 lines, comments and all.
+> you want -- it's about 500 lines, comments and all.
 
 ## The easy way: paste this into Claude Code and let it build everything
 
@@ -77,9 +77,33 @@ understand what Claude made for you.
 
 ---
 
-## Manual setup (by hand, if you skip the prompt above)
+## The other easy way: one command
 
-The bundled [`files/`](files/) folder next to this guide has everything:
+If you'd rather not paste anything, clone this repo and run the setup script.
+It checks your Python, builds a private virtualenv, installs the pinned
+dependencies, walks you through the one-time Garmin login, and pulls your last
+3 days so you can see it working. Re-running it is safe -- it skips whatever is
+already done.
+
+```bash
+git clone https://github.com/baileygrant2014-bit/Garmin.git garmin-ai
+cd garmin-ai
+./setup.sh
+```
+
+The only thing you type is your Garmin email and password, once, into a hidden
+prompt. macOS and Linux only -- on Windows, follow the manual steps below.
+
+When it finishes you'll have a `garmin/` folder of notes. Open Claude Code in
+that folder and ask it something like *"read my garmin notes and tell me how my
+recovery looks this week"*. The repo ships a `CLAUDE.md` so Claude already knows
+the layout, how to refresh the data, and not to go near your token.
+
+---
+
+## Manual setup (by hand, if you skip both of the above)
+
+Prefer to do it yourself? The bundled [`files/`](files/) folder has everything:
 [`sync_garmin.py`](files/sync_garmin.py) (the pull script),
 [`requirements.txt`](files/requirements.txt) (what to install), and
 [`garmin-sync.yml`](files/garmin-sync.yml) (the optional cloud automation for

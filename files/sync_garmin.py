@@ -470,10 +470,21 @@ def main() -> None:
     if days != args.days:
         print(f"--days limited to {days} (protects against rate-limiting).")
 
+    # Check this BEFORE the try: a missing token dir raises FileNotFoundError,
+    # which is an OSError, and would otherwise be reported as a network problem
+    # -- the exact wrong advice on someone's very first run.
+    if not args.tokens.exists() or not any(args.tokens.iterdir()):
+        sys.exit(
+            f"Not logged in yet -- no saved token in {args.tokens}.\n"
+            f"Run this once: {CMD} --login"
+        )
+
     try:
         api = resume(args.tokens)
     except GarminConnectAuthenticationError:
         sys.exit(f"No valid saved token in {args.tokens}.\nRun: {CMD} --login")
+    except FileNotFoundError:
+        sys.exit(f"Token folder {args.tokens} went missing.\nRun: {CMD} --login")
     except (GarminConnectConnectionError, OSError) as exc:
         sys.exit(
             f"Could not reach Garmin ({type(exc).__name__}). This looks like a "
